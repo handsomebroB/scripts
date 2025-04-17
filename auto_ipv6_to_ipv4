@@ -1,0 +1,259 @@
+#!/bin/sh
+echo "Welcome to IPv6 to IPv4 NAT Forwarding Setup Script"
+echo "This script will help you configure port forwarding rules."
+echo "-------------------------------------------------------"
+
+# 检测依赖项
+echo "Checking dependencies..."
+if ! command -v ip >/dev/null; then
+    echo "Error: 'ip' command not found. Please install 'iproute2' package."
+    echo "Run: opkg update && opkg install iproute2"
+    exit 1
+fi
+if ! command -v nft >/dev/null; then
+    echo "Error: 'nft' command not found. Please install 'nftables' package."
+    echo "Run: opkg update && opkg install nftables"
+    exit 1
+fi
+echo "Dependencies check passed."
+
+# 存储规则的临时文件
+RULES_FILE="/tmp/nat_forward_rules"
+> "$RULES_FILE"
+
+# 循环添加规则
+while true; do
+    echo "-------------------------------------------------------"
+    echo "Listing available network interfaces:"
+    INTERFACES=$(ip link show | grep '^[0-9]' | cut -d: -f2 | awk '{print $1}' | grep -v 'lo')
+    if [ -z "$INTERFACES" ]; then
+        echo "Error: No network interfaces found. Please check your network configuration."
+        exit 1
+    fi
+    echo "$INTERFACES" | nl -w2 -s'. '
+    echo "-------------------------------------------------------"
+    echo "Please select an interface by number (e.g., 1):"
+    read IF_NUM
+    IF_NAME=$(echo "$INTERFACES" | sed -n "${IF_NUM}p")
+    if [ -z "$IF_NAME" ]; then
+        echo "Error: Invalid selection. Please try again."
+        continue
+    fi
+    echo "Selected interface: $IF_NAME"
+
+    # 获取接口的 IPv6 地址（仅供参考）
+    IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | grep -oP '(?<=inet6\s)[0-9a-f:]+(?=/)' | head -1)
+    if [ -z "$IPV6_ADDR" ]; then
+        echo "Warning: No IPv6 address found for $IF_NAME. Address will be dynamically fetched at runtime."
+    else
+        echo "Current IPv6 address for $IF_NAME: $IPV6_ADDR (will be dynamically updated at runtime)"
+    fi
+
+    # 提示输入源端口
+    echo "Enter source port to forward (e.g., 5858):"
+    read SRC_PORT
+    if ! echo "$SRC_PORT" | grep -q '^[0-9]\+$' || [ "$SRC_PORT" -lt 1 ] || [ "$SRC_PORT" -gt 65535 ]; then
+        echo "Error: Invalid port number. Must be between 1 and 65535."
+        continue
+    fi
+
+    # 提示输入目标 IP
+    echo "Enter destination IPv4 address (e.g., 192.168.8.8):"
+    read DEST_IP
+    if ! echo "$DEST_IP" | grep -q '^[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}\.[0-9]\{1,3\}$'; then
+        echo "Error: Invalid IPv4 address format."
+        continue
+    fi
+
+    # 提示输入目标端口
+    echo "Enter destination port (e.g., 8080):"
+    read DEST_PORT
+    if ! echo "$DEST_PORT" | grep -q '^[0-9]\+$' || [ "$DEST_PORT" -lt 1 ] || [ "$DEST_PORT" -gt 65535 ]; then
+        echo "Error: Invalid port number. Must be between 1 and 65535."
+        continue
+    fi
+
+    # 提示输入协议
+    echo "Enter protocol (tcp or udp):"
+    read PROTO
+    if [ "$PROTO" != "tcp" ] && [ "$PROTO" != "udp" ]; then
+        echo "Error: Protocol must be 'tcp' or 'udp'."
+        continue
+    fi
+
+    # 保存规则
+    echo "$IF_NAME:$SRC_PORT:$DEST_IP:$DEST_PORT:$PROTO" >> "$RULES_FILE"
+    echo "Rule added: $IF_NAME:IPv6:$SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)"
+
+    # 询问是否继续添加规则
+    echo "Do you want to add another forwarding rule? (y/n)"
+    read CONTINUE
+    if [ "$CONTINUE" != "y" ] && [ "$CONTINUE" != "Y" ]; then
+        break
+    fi
+done
+
+# 复制规则文件到永久存储
+cp "$RULES_FILE" "/etc/nat_forward_rules"
+echo "Rules saved to /etc/nat_forward_rules"
+
+# 清理旧的状态文件和规则
+rm -f /tmp/ipv6_nat_status 2>/dev/null || true
+rm -f /tmp/ipv6_nat_address_* 2>/dev/null || true
+nft flush table inet my_nat_table 2>/dev/null || true
+nft delete table inet my_nat_table 2>/dev/null || true
+echo "Cleared old status and rules if any."
+
+# 提示用户是否需要加入 hotplug 配置
+echo "Do you want to add hotplug configuration for dynamic interface events (Scheme 3)? (y/n)"
+echo "Note: This will apply rules when network interfaces become ready, which is critical for PPPoE dial-up scenarios."
+read USE_HOTPLUG
+if [ "$USE_HOTPLUG" = "y" ] || [ "$USE_HOTPLUG" = "Y" ]; then
+    echo "Checking hotplug.d compatibility..."
+    if [ -d "/etc/hotplug.d" ] && command -v hotplug-call >/dev/null 2>&1; then
+        echo "hotplug.d is supported. Configuring hotplug event trigger (Scheme 3)."
+        # 生成 hotplug 脚本
+        HOTPLUG_SCRIPT="/etc/hotplug.d/iface/99-ipv6-nat-forward"
+        mkdir -p /etc/hotplug.d/iface 2>/dev/null || true
+        cat > "$HOTPLUG_SCRIPT" << 'EOF'
+#!/bin/sh
+# 监听网络接口事件，应用 NAT 转发规则
+[ "$ACTION" = "ifup" ] || exit 0
+
+# 检查规则文件是否存在
+RULES_FILE="/etc/nat_forward_rules"
+if [ ! -f "$RULES_FILE" ]; then
+    logger -t ipv6_nat "Rules file not found. Skipping."
+    exit 1
+fi
+
+# 检查接口是否在规则文件中
+# INTERFACE 是 hotplug 提供的环境变量，表示触发事件的接口
+grep "^$INTERFACE:" "$RULES_FILE" >/dev/null || exit 0
+
+logger -t ipv6_nat "Interface $INTERFACE is up. Checking and applying NAT forwarding rules."
+
+# 获取当前 IPv6 地址
+IPV6_ADDR=$(ip -6 addr show dev "$INTERFACE" | grep -oP '(?<=inet6\s)[0-9a-f:]+(?=/)' | head -1)
+if [ -z "$IPV6_ADDR" ]; then
+    logger -t ipv6_nat "No IPv6 address found for $INTERFACE. Skipping."
+    exit 0
+fi
+
+# 检查规则是否已成功应用，且是否基于当前 IPv6 地址
+STATUS_FILE="/tmp/ipv6_nat_status"
+ADDRESS_FILE="/tmp/ipv6_nat_address_$INTERFACE"
+if [ -f "$STATUS_FILE" ] && grep -q "success" "$STATUS_FILE" && [ -f "$ADDRESS_FILE" ] && grep -q "$IPV6_ADDR" "$ADDRESS_FILE"; then
+    logger -t ipv6_nat "Interface $INTERFACE is up, NAT rules already applied successfully with current IPv6 address $IPV6_ADDR. Skipping."
+    exit 0
+fi
+
+logger -t ipv6_nat "Interface $INTERFACE is up. Applying NAT forwarding rules for IPv6 address $IPV6_ADDR."
+
+# 清理旧规则（无论是否成功应用，都清理以避免重复规则）
+nft flush table inet my_nat_table 2>/dev/null || true
+nft delete table inet my_nat_table 2>/dev/null || true
+nft add table inet my_nat_table 2>/dev/null || true
+nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true
+nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+
+# 计数成功应用的规则数量
+SUCCESS_COUNT=0
+TOTAL_RULES=$(wc -l < "$RULES_FILE")
+
+# 应用每个规则
+while IFS=':' read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
+    # 仅处理与当前接口相关的规则
+    if [ "$IF_NAME" = "$INTERFACE" ]; then
+        echo "Applying rule for $IF_NAME with IPv6 $IPV6_ADDR: $SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)" | logger -t ipv6_nat
+        if nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && \
+           nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then
+            echo "Rule applied for $IF_NAME." | logger -t ipv6_nat
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+        else
+            echo "Failed to apply rule for $IF_NAME." | logger -t ipv6_nat
+        fi
+    fi
+done < "$RULES_FILE"
+
+# 更新状态文件和地址文件
+if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then
+    echo "success" > "$STATUS_FILE"
+    echo "$IPV6_ADDR" > "$ADDRESS_FILE"
+    echo "All $SUCCESS_COUNT/$TOTAL_RULES IPv6 NAT forwarding rules applied successfully via hotplug for $IPV6_ADDR." | logger -t ipv6_nat
+else
+    echo "partial" > "$STATUS_FILE"
+    echo "$IPV6_ADDR" > "$ADDRESS_FILE"
+    echo "Only $SUCCESS_COUNT/$TOTAL_RULES IPv6 NAT forwarding rules applied via hotplug for $IPV6_ADDR." | logger -t ipv6_nat
+fi
+EOF
+        # 赋予 hotplug 脚本执行权限
+        chmod +x "$HOTPLUG_SCRIPT"
+        echo "Hotplug script created at $HOTPLUG_SCRIPT."
+    else
+        echo "Warning: hotplug.d is not supported on this system."
+        echo "Do you want to add a cron job as a fallback (Scheme 2) to periodically check and apply rules? (y/n)"
+        read USE_CRON
+        if [ "$USE_CRON" = "y" ] || [ "$USE_CRON" = "Y" ]; then
+            # 安装 cron（如果未安装）
+            if ! opkg list-installed | grep -q cron; then
+                echo "Installing cron for scheduled task..."
+                opkg update
+                opkg install cron
+            fi
+            # 提示用户选择 cron 任务的时间间隔
+            echo "Enter the time interval for cron job in minutes (e.g., 5 for every 5 minutes, recommended):"
+            read CRON_INTERVAL
+            if ! echo "$CRON_INTERVAL" | grep -q '^[0-9]\+$' || [ "$CRON_INTERVAL" -lt 1 ] || [ "$CRON_INTERVAL" -gt 60 ]; then
+                echo "Invalid interval. Using default interval of 5 minutes."
+                CRON_INTERVAL=5
+            fi
+            # 添加定时任务
+            CRON_JOB="*/$CRON_INTERVAL * * * * /bin/sh -c 'RULES_FILE=\"/etc/nat_forward_rules\"; STATUS_FILE=\"/tmp/ipv6_nat_status\"; SUCCESS_COUNT=0; TOTAL_RULES=$(wc -l < \"$RULES_FILE\"); NEED_UPDATE=0; while IFS=\":\" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do ADDRESS_FILE=\"/tmp/ipv6_nat_address_\$IF_NAME\"; IPV6_ADDR=$(ip -6 addr show dev \"\$IF_NAME\" | grep -oP \"(?<=inet6\s)[0-9a-f:]+(?=/)\" | head -1); if [ -n \"\$IPV6_ADDR\" ] && ( [ ! -f \"\$ADDRESS_FILE\" ] || ! grep -q \"\$IPV6_ADDR\" \"\$ADDRESS_FILE\" ) || ( [ ! -f \"\$STATUS_FILE\" ] || ! grep -q \"success\" \"\$STATUS_FILE\" ); then NEED_UPDATE=1; break; fi; done < \"$RULES_FILE\"; if [ \$NEED_UPDATE -eq 1 ]; then nft flush table inet my_nat_table 2>/dev/null || true; nft delete table inet my_nat_table 2>/dev/null || true; nft add table inet my_nat_table 2>/dev/null || true; nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true; nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true; while IFS=\":\" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do ADDRESS_FILE=\"/tmp/ipv6_nat_address_\$IF_NAME\"; IPV6_ADDR=$(ip -6 addr show dev \"\$IF_NAME\" | grep -oP \"(?<=inet6\s)[0-9a-f:]+(?=/)\" | head -1); if [ -n \"\$IPV6_ADDR\" ] && nft add rule inet my_nat_table nat iifname \"\$IF_NAME\" ip6 daddr \$IPV6_ADDR \$PROTO dport \$SRC_PORT dnat to \$DEST_IP:\$DEST_PORT 2>/dev/null && nft add rule inet my_nat_table postrouting ip saddr \$DEST_IP \$PROTO sport \$DEST_PORT snat to \$IPV6_ADDR 2>/dev/null; then SUCCESS_COUNT=$((\$SUCCESS_COUNT + 1)); echo \"\$IPV6_ADDR\" > \"\$ADDRESS_FILE\"; logger -t ipv6_nat \"Rule applied for \$IF_NAME via cron with IPv6 \$IPV6_ADDR.\"; fi; done < \"$RULES_FILE\"; if [ \$SUCCESS_COUNT -eq \$TOTAL_RULES ]; then echo \"success\" > \"\$STATUS_FILE\"; logger -t ipv6_nat \"All \$SUCCESS_COUNT/\$TOTAL_RULES rules applied via cron.\"; else echo \"partial\" > \"\$STATUS_FILE\"; logger -t ipv6_nat \"Only \$SUCCESS_COUNT/\$TOTAL_RULES rules applied via cron.\"; fi; fi'"
+            (crontab -l 2>/dev/null | grep -v "ipv6_nat_forward"; echo "$CRON_JOB") | crontab -
+            echo "Cron job added to check and apply rules every $CRON_INTERVAL minutes if not successful or if IPv6 address changes."
+            echo "Note: The cron job has minimal impact on system performance (negligible CPU and memory usage)."
+        else
+            echo "No fallback mechanism added. Only hotplug script (Scheme 3) will be used if supported."
+        fi
+    fi
+else
+    echo "Hotplug configuration skipped."
+    echo "Do you want to add a cron job as a fallback (Scheme 2) to periodically check and apply rules? (y/n)"
+    read USE_CRON
+    if [ "$USE_CRON" = "y" ] || [ "$USE_CRON" = "Y" ]; then
+        # 安装 cron（如果未安装）
+        if ! opkg list-installed | grep -q cron; then
+            echo "Installing cron for scheduled task..."
+            opkg update
+            opkg install cron
+        fi
+        # 提示用户选择 cron 任务的时间间隔
+        echo "Enter the time interval for cron job in minutes (e.g., 5 for every 5 minutes, recommended):"
+        read CRON_INTERVAL
+        if ! echo "$CRON_INTERVAL" | grep -q '^[0-9]\+$' || [ "$CRON_INTERVAL" -lt 1 ] || [ "$CRON_INTERVAL" -gt 60 ]; then
+            echo "Invalid interval. Using default interval of 5 minutes."
+            CRON_INTERVAL=5
+        fi
+        # 添加定时任务
+        CRON_JOB="*/$CRON_INTERVAL * * * * /bin/sh -c 'RULES_FILE=\"/etc/nat_forward_rules\"; STATUS_FILE=\"/tmp/ipv6_nat_status\"; SUCCESS_COUNT=0; TOTAL_RULES=$(wc -l < \"$RULES_FILE\"); NEED_UPDATE=0; while IFS=\":\" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do ADDRESS_FILE=\"/tmp/ipv6_nat_address_\$IF_NAME\"; IPV6_ADDR=$(ip -6 addr show dev \"\$IF_NAME\" | grep -oP \"(?<=inet6\s)[0-9a-f:]+(?=/)\" | head -1); if [ -n \"\$IPV6_ADDR\" ] && ( [ ! -f \"\$ADDRESS_FILE\" ] || ! grep -q \"\$IPV6_ADDR\" \"\$ADDRESS_FILE\" ) || ( [ ! -f \"\$STATUS_FILE\" ] || ! grep -q \"success\" \"\$STATUS_FILE\" ); then NEED_UPDATE=1; break; fi; done < \"$RULES_FILE\"; if [ \$NEED_UPDATE -eq 1 ]; then nft flush table inet my_nat_table 2>/dev/null || true; nft delete table inet my_nat_table 2>/dev/null || true; nft add table inet my_nat_table 2>/dev/null || true; nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true; nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true; while IFS=\":\" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do ADDRESS_FILE=\"/tmp/ipv6_nat_address_\$IF_NAME\"; IPV6_ADDR=$(ip -6 addr show dev \"\$IF_NAME\" | grep -oP \"(?<=inet6\s)[0-9a-f:]+(?=/)\" | head -1); if [ -n \"\$IPV6_ADDR\" ] && nft add rule inet my_nat_table nat iifname \"\$IF_NAME\" ip6 daddr \$IPV6_ADDR \$PROTO dport \$SRC_PORT dnat to \$DEST_IP:\$DEST_PORT 2>/dev/null && nft add rule inet my_nat_table postrouting ip saddr \$DEST_IP \$PROTO sport \$DEST_PORT snat to \$IPV6_ADDR 2>/dev/null; then SUCCESS_COUNT=$((\$SUCCESS_COUNT + 1)); echo \"\$IPV6_ADDR\" > \"\$ADDRESS_FILE\"; logger -t ipv6_nat \"Rule applied for \$IF_NAME via cron with IPv6 \$IPV6_ADDR.\"; fi; done < \"$RULES_FILE\"; if [ \$SUCCESS_COUNT -eq \$TOTAL_RULES ]; then echo \"success\" > \"\$STATUS_FILE\"; logger -t ipv6_nat \"All \$SUCCESS_COUNT/\$TOTAL_RULES rules applied via cron.\"; else echo \"partial\" > \"\$STATUS_FILE\"; logger -t ipv6_nat \"Only \$SUCCESS_COUNT/\$TOTAL_RULES rules applied via cron.\"; fi; fi'"
+        (crontab -l 2>/dev/null | grep -v "ipv6_nat_forward"; echo "$CRON_JOB") | crontab -
+        echo "Cron job added to check and apply rules every $CRON_INTERVAL minutes if not successful or if IPv6 address changes."
+        echo "Note: The cron job has minimal impact on system performance (negligible CPU and memory usage)."
+    else
+        echo "No fallback mechanism added. No mechanisms will be used to apply rules."
+        echo "Warning: Without hotplug or cron, rules will not be applied automatically. You will need to apply them manually."
+    fi
+fi
+
+# 询问是否立即应用规则
+echo "Do you want to apply the rules now? (y/n)"
+read APPLY_NOW
+if [ "$APPLY_NOW" = "y" ] || [ "$APPLY_NOW" = "Y" ]; then
+    # 直接应用规则
+    echo "Applying rules directly..."
+    /bin/sh -c 'RULES_FILE="/etc/nat_forward_rules"; STATUS_FILE="/tmp/ipv6_nat_status"; nft flush table inet my_nat_table 2>/dev/null || true; nft delete table inet my_nat_table 2>/dev/null || true; nft add table inet my_nat_table 2>/dev/null || true; nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true; nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true; SUCCESS_COUNT=0; TOTAL_RULES=$(wc -l < "$RULES_FILE"); while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | grep -oP "(?<=inet6\s)[0-9a-f:]+(?=/)" | head -1); ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"; if [ -n "$IPV6_ADDR" ] && nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then SUCCESS_COUNT=$(($SUCCESS_COUNT + 1)); echo "$IPV6_ADDR" > "$ADDRESS_FILE"; logger -t ipv6_nat "Rule applied for $IF_NAME manually with IPv6 $IPV6_ADDR."; fi; done < "$RULES_FILE"; if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then echo "success" > "$STATUS_FILE"; logger -t ipv6_nat "All $SUCCESS_COUNT/$TOTAL_RULES rules applied manually."; else echo "partial" > "$STATUS_FILE"; logger -t ipv6_nat "Only $SUCCESS_COUNT/$TOTAL_RULES rules applied manually."; fi'
+    echo "Rules applied. Check logs with 'logread | grep ipv6_nat' for details."
+fi
+
+echo "Setup complete. Rules will be applied via hotplug or cron (if configured)."
