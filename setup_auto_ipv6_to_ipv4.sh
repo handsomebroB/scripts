@@ -225,7 +225,7 @@ while IFS=':' read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
     # 仅处理与当前接口相关的规则
     if [ "$IF_NAME" = "$INTERFACE" ]; then
         logger -t ipv6_nat "为 $IF_NAME 应用规则，IPv6 地址 $IPV6_ADDR: $SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)"
-        DNAT_ERROR=$(nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>&1)
+        DNAT_ERROR=$(nft add rule inet my_nat_table nat iifname \""$IF_NAME"\" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>&1)
         if [ $? -eq 0 ]; then
             logger -t ipv6_nat "DNAT 规则已为 $IF_NAME 应用。"
         else
@@ -241,7 +241,7 @@ while IFS=':' read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
     fi
 done < "$RULES_FILE"
 
-# 更新状态文件和地址 Ascend
+# 更新状态文件和地址文件
 if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then
     echo "success" > "$STATUS_FILE"
     echo "$IPV6_ADDR" > "$ADDRESS_FILE"
@@ -325,7 +325,7 @@ if [ $NEED_UPDATE -eq 1 ]; then
         IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
         if [ -n "$IPV6_ADDR" ]; then
             logger -t ipv6_nat "尝试通过 cron 为 $IF_NAME 应用规则，IPv6 地址为 $IPV6_ADDR: $SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)"
-            DNAT_ERROR=$(nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>&1)
+            DNAT_ERROR=$(nft add rule inet my_nat_table nat iifname \""$IF_NAME"\" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>&1)
             if [ $? -eq 0 ]; then
                 logger -t ipv6_nat "DNAT 规则已通过 cron 为 $IF_NAME 应用。"
             else
@@ -404,7 +404,7 @@ while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
     ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"
     if [ -n "$IPV6_ADDR" ]; then
         logger -t ipv6_nat "尝试为 $IF_NAME 应用规则，IPv6 地址为 $IPV6_ADDR: $SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)"
-        DNAT_ERROR=$(nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>&1)
+        DNAT_ERROR=$(nft add rule inet my_nat_table nat iifname \""$IF_NAME"\" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>&1)
         if [ $? -eq 0 ]; then
             logger -t ipv6_nat "DNAT 规则已手动为 $IF_NAME 应用。"
         else
