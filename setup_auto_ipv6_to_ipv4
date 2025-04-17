@@ -143,17 +143,27 @@ nft delete table inet my_nat_table 2>/dev/null || true
 echo "已清除旧状态和规则（如果有）。"
 
 # 提示用户是否需要加入 hotplug 配置
-echo "是否要添加 hotplug 配置以支持动态接口事件（方案 3）？（y/n）"
-echo "注意：这将在网络接口准备好时应用规则，对于 PPPoE 拨号场景至关重要。"
+echo "是否要添加 hotplug 配置以支持动态接口事件？（y/n）"
+echo "注意：这将在网络接口准备好时自动应用规则，对于 PPPoE 拨号场景至关重要。"
 read USE_HOTPLUG
+HOTPLUG_SCRIPT="/etc/hotplug.d/iface/99-ipv6-nat-forward"
 if [ "$USE_HOTPLUG" = "y" ] || [ "$USE_HOTPLUG" = "Y" ]; then
     echo "检查 hotplug.d 兼容性..."
     if [ -d "/etc/hotplug.d" ] && command -v hotplug-call >/dev/null 2>&1; then
-        echo "支持 hotplug.d。配置 hotplug 事件触发（方案 3）。"
-        # 生成 hotplug 脚本
-        HOTPLUG_SCRIPT="/etc/hotplug.d/iface/99-ipv6-nat-forward"
-        mkdir -p /etc/hotplug.d/iface 2>/dev/null || true
-        cat > "$HOTPLUG_SCRIPT" << 'EOF'
+        echo "支持 hotplug.d。配置 hotplug 事件触发。"
+        # 检查是否已存在 hotplug 脚本
+        if [ -f "$HOTPLUG_SCRIPT" ]; then
+            echo "警告：hotplug 脚本 $HOTPLUG_SCRIPT 已存在。是否覆盖？（y/n）"
+            read OVERWRITE_HOTPLUG
+            if [ "$OVERWRITE_HOTPLUG" != "y" ] && [ "$OVERWRITE_HOTPLUG" != "Y" ]; then
+                echo "不覆盖现有 hotplug 脚本，跳过配置。"
+                USE_HOTPLUG="n"
+            fi
+        fi
+        if [ "$USE_HOTPLUG" = "y" ] || [ "$USE_HOTPLUG" = "Y" ]; then
+            # 生成 hotplug 脚本
+            mkdir -p /etc/hotplug.d/iface 2>/dev/null || true
+            cat > "$HOTPLUG_SCRIPT" << 'EOF'
 #!/bin/sh
 # 监听网络接口事件，应用 NAT 转发规则
 [ "$ACTION" = "ifup" ] || exit 0
@@ -203,13 +213,13 @@ TOTAL_RULES=$(wc -l < "$RULES_FILE")
 while IFS=':' read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
     # 仅处理与当前接口相关的规则
     if [ "$IF_NAME" = "$INTERFACE" ]; then
-        echo "为 $IF_NAME 应用规则，IPv6 地址 $IPV6_ADDR: $SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)" | logger -t ipv6_nat
+        logger -t ipv6_nat "为 $IF_NAME 应用规则，IPv6 地址 $IPV6_ADDR: $SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)"
         if nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && \
            nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then
-            echo "规则已为 $IF_NAME 应用。" | logger -t ipv6_nat
+            logger -t ipv6_nat "规则已为 $IF_NAME 应用。"
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
         else
-            echo "无法为 $IF_NAME 应用规则。" | logger -t ipv6_nat
+            logger -t ipv6_nat "无法为 $IF_NAME 应用规则。"
         fi
     fi
 done < "$RULES_FILE"
@@ -218,106 +228,53 @@ done < "$RULES_FILE"
 if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then
     echo "success" > "$STATUS_FILE"
     echo "$IPV6_ADDR" > "$ADDRESS_FILE"
-    echo "所有 $SUCCESS_COUNT/$TOTAL_RULES 条 IPv6 NAT 转发规则通过 hotplug 成功应用，地址为 $IPV6_ADDR。" | logger -t ipv6_nat
+    logger -t ipv6_nat "所有 $SUCCESS_COUNT/$TOTAL_RULES 条 IPv6 NAT 转发规则通过 hotplug 成功应用，地址为 $IPV6_ADDR。"
 else
     echo "partial" > "$STATUS_FILE"
     echo "$IPV6_ADDR" > "$ADDRESS_FILE"
-    echo "仅 $SUCCESS_COUNT/$TOTAL_RULES 条 IPv6 NAT 转发规则通过 hotplug 应用，地址为 $IPV6_ADDR。" | logger -t ipv6_nat
+    logger -t ipv6_nat "仅 $SUCCESS_COUNT/$TOTAL_RULES 条 IPv6 NAT 转发规则通过 hotplug 应用，地址为 $IPV6_ADDR。"
 fi
 EOF
-        # 赋予 hotplug 脚本执行权限
-        chmod +x "$HOTPLUG_SCRIPT" 2>/dev/null || true
-        echo "Hotplug 脚本已创建于 $HOTPLUG_SCRIPT。"
+            # 赋予 hotplug 脚本执行权限
+            chmod +x "$HOTPLUG_SCRIPT" 2>/dev/null || true
+            echo "Hotplug 脚本已创建于 $HOTPLUG_SCRIPT。"
+        fi
     else
         echo "警告：此系统不支持 hotplug.d。"
-        echo "是否要添加 cron 任务作为备用（方案 2）以定期检查并应用规则？（y/n）"
-        read USE_CRON
-        if [ "$USE_CRON" = "y" ] || [ "$USE_CRON" = "Y" ]; then
-            # 安装 cron（如果未安装）
-            if ! opkg list-installed | grep -q cron; then
-                echo "安装 cron 用于定时任务..."
-                opkg update
-                opkg install cron
-            fi
-            # 提示用户选择 cron 任务的时间间隔
-            echo "请输入 cron 任务的时间间隔（分钟，例如，5 表示每 5 分钟，推荐）："
-            read CRON_INTERVAL
-            if ! echo "$CRON_INTERVAL" | grep -q '^[0-9]\+$' || [ "$CRON_INTERVAL" -lt 1 ] || [ "$CRON_INTERVAL" -gt 60 ]; then
-                echo "无效的间隔。使用默认间隔 5 分钟。"
-                CRON_INTERVAL=5
-            fi
-            # 创建单独的 cron 脚本
-            CRON_SCRIPT="/etc/cron.d/ipv6_nat_forward.sh"
-            cat > "$CRON_SCRIPT" << 'EOF'
-#!/bin/sh
-RULES_FILE="/etc/nat_forward_rules"
-STATUS_FILE="/tmp/ipv6_nat_status"
-SUCCESS_COUNT=0
-TOTAL_RULES=$(wc -l < "$RULES_FILE")
-NEED_UPDATE=0
-while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
-    ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"
-    IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
-    if [ -n "$IPV6_ADDR" ] && ( [ ! -f "$ADDRESS_FILE" ] || ! grep -q "$IPV6_ADDR" "$ADDRESS_FILE" ) || ( [ ! -f "$STATUS_FILE" ] || ! grep -q "success" "$STATUS_FILE" ); then
-        NEED_UPDATE=1
-        break
-    fi
-done < "$RULES_FILE"
-if [ $NEED_UPDATE -eq 1 ]; then
-    nft flush table inet my_nat_table 2>/dev/null || true
-    nft delete table inet my_nat_table 2>/dev/null || true
-    nft add table inet my_nat_table 2>/dev/null || true
-    nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true
-    nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
-    while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
-        ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"
-        IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
-        if [ -n "$IPV6_ADDR" ] && nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && \
-           nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then
-            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            echo "$IPV6_ADDR" > "$ADDRESS_FILE"
-            logger -t ipv6_nat "规则已通过 cron 为 $IF_NAME 应用，IPv6 地址为 $IPV6_ADDR。"
-        fi
-    done < "$RULES_FILE"
-    if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then
-        echo "success" > "$STATUS_FILE"
-        logger -t ipv6_nat "所有 $SUCCESS_COUNT/$TOTAL_RULES 条规则通过 cron 应用。"
-    else
-        echo "partial" > "$STATUS_FILE"
-        logger -t ipv6_nat "仅 $SUCCESS_COUNT/$TOTAL_RULES 条规则通过 cron 应用。"
+        USE_HOTPLUG="n"
     fi
 fi
-EOF
-            chmod +x "$CRON_SCRIPT" 2>/dev/null || true
-            # 添加定时任务
-            CRON_JOB="*/$CRON_INTERVAL * * * * $CRON_SCRIPT"
-            (crontab -l 2>/dev/null | grep -v "ipv6_nat_forward"; echo "$CRON_JOB") | crontab -
-            echo "Cron 任务已添加，每 $CRON_INTERVAL 分钟检查并应用规则（如果未成功或 IPv6 地址变更）。"
-            echo "注意：cron 任务对系统性能影响极小（CPU 和内存使用量可忽略）。"
-        else
-            echo "未添加备用机制。仅在支持时使用 hotplug 脚本（方案 3）。"
+
+# 无论是否配置 hotplug，都询问是否需要 cron 作为备用
+echo "是否要添加 cron 任务以定期检查并应用规则？（y/n）"
+echo "注意：这将定期检查接口状态和规则应用情况，作为备用机制。"
+read USE_CRON
+CRON_SCRIPT="/etc/cron.d/ipv6_nat_forward.sh"
+if [ "$USE_CRON" = "y" ] || [ "$USE_CRON" = "Y" ]; then
+    # 安装 cron（如果未安装）
+    if ! opkg list-installed | grep -q cron; then
+        echo "安装 cron 用于定时任务..."
+        opkg update
+        opkg install cron
+    fi
+    # 提示用户选择 cron 任务的时间间隔
+    echo "请输入 cron 任务的时间间隔（分钟，例如，5 表示每 5 分钟，推荐）："
+    read CRON_INTERVAL
+    if ! echo "$CRON_INTERVAL" | grep -q '^[0-9]\+$' || [ "$CRON_INTERVAL" -lt 1 ] || [ "$CRON_INTERVAL" -gt 60 ]; then
+        echo "无效的间隔。使用默认间隔 5 分钟。"
+        CRON_INTERVAL=5
+    fi
+    # 检查是否已存在 cron 脚本
+    if [ -f "$CRON_SCRIPT" ]; then
+        echo "警告：cron 脚本 $CRON_SCRIPT 已存在。是否覆盖？（y/n）"
+        read OVERWRITE_CRON
+        if [ "$OVERWRITE_CRON" != "y" ] && [ "$OVERWRITE_CRON" != "Y" ]; then
+            echo "不覆盖现有 cron 脚本，跳过配置。"
+            USE_CRON="n"
         fi
     fi
-else
-    echo "已跳过 hotplug 配置。"
-    echo "是否要添加 cron 任务作为备用（方案 2）以定期检查并应用规则？（y/n）"
-    read USE_CRON
     if [ "$USE_CRON" = "y" ] || [ "$USE_CRON" = "Y" ]; then
-        # 安装 cron（如果未安装）
-        if ! opkg list-installed | grep -q cron; then
-            echo "安装 cron 用于定时任务..."
-            opkg update
-            opkg install cron
-        fi
-        # 提示用户选择 cron 任务的时间间隔
-        echo "请输入 cron 任务的时间间隔（分钟，例如，5 表示每 5 分钟，推荐）："
-        read CRON_INTERVAL
-        if ! echo "$CRON_INTERVAL" | grep -q '^[0-9]\+$' || [ "$CRON_INTERVAL" -lt 1 ] || [ "$CRON_INTERVAL" -gt 60 ]; then
-            echo "无效的间隔。使用默认间隔 5 分钟。"
-            CRON_INTERVAL=5
-        fi
         # 创建单独的 cron 脚本
-        CRON_SCRIPT="/etc/cron.d/ipv6_nat_forward.sh"
         cat > "$CRON_SCRIPT" << 'EOF'
 #!/bin/sh
 RULES_FILE="/etc/nat_forward_rules"
@@ -347,6 +304,8 @@ if [ $NEED_UPDATE -eq 1 ]; then
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
             echo "$IPV6_ADDR" > "$ADDRESS_FILE"
             logger -t ipv6_nat "规则已通过 cron 为 $IF_NAME 应用，IPv6 地址为 $IPV6_ADDR。"
+        else
+            logger -t ipv6_nat "无法通过 cron 为 $IF_NAME 应用规则，IPv6 地址为 $IPV6_ADDR。"
         fi
     done < "$RULES_FILE"
     if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then
@@ -364,8 +323,9 @@ EOF
         (crontab -l 2>/dev/null | grep -v "ipv6_nat_forward"; echo "$CRON_JOB") | crontab -
         echo "Cron 任务已添加，每 $CRON_INTERVAL 分钟检查并应用规则（如果未成功或 IPv6 地址变更）。"
         echo "注意：cron 任务对系统性能影响极小（CPU 和内存使用量可忽略）。"
-    else
-        echo "未添加备用机制。不会使用任何机制自动应用规则。"
+    fi
+else
+    if [ "$USE_HOTPLUG" != "y" ] && [ "$USE_HOTPLUG" != "Y" ]; then
         echo "警告：没有 hotplug 或 cron，规则将不会自动应用。您需要手动应用它们。"
     fi
 fi
@@ -391,11 +351,18 @@ TOTAL_RULES=$(wc -l < "$RULES_FILE")
 while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
     IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
     ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"
-    if [ -n "$IPV6_ADDR" ] && nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && \
-       nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then
-        SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-        echo "$IPV6_ADDR" > "$ADDRESS_FILE"
-        logger -t ipv6_nat "规则已手动为 $IF_NAME 应用，IPv6 地址为 $IPV6_ADDR。"
+    if [ -n "$IPV6_ADDR" ]; then
+        logger -t ipv6_nat "尝试为 $IF_NAME 应用规则，IPv6 地址为 $IPV6_ADDR: $SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)"
+        if nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && \
+           nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            echo "$IPV6_ADDR" > "$ADDRESS_FILE"
+            logger -t ipv6_nat "规则已手动为 $IF_NAME 应用，IPv6 地址为 $IPV6_ADDR。"
+        else
+            logger -t ipv6_nat "无法为 $IF_NAME 应用规则，IPv6 地址为 $IPV6_ADDR。"
+        fi
+    else
+        logger -t ipv6_nat "未找到 $IF_NAME 的 IPv6 地址，跳过规则应用。"
     fi
 done < "$RULES_FILE"
 if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then
@@ -409,6 +376,7 @@ EOF
     chmod +x "$APPLY_SCRIPT" 2>/dev/null || true
     /bin/sh "$APPLY_SCRIPT"
     echo "规则已应用。使用 'logread | grep ipv6_nat' 查看日志详情。"
+    echo "您也可以使用 'nft list ruleset' 检查 NAT 规则是否正确加载。"
 fi
 
 echo "设置完成。规则将通过 hotplug 或 cron 应用（如果已配置）。"
