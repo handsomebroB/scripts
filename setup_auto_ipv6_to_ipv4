@@ -188,7 +188,7 @@ else
 fi
 EOF
         # 赋予 hotplug 脚本执行权限
-        chmod +x "$HOTPLUG_SCRIPT"
+        chmod +x "$HOTPLUG_SCRIPT" 2>/dev/null || true
         echo "Hotplug script created at $HOTPLUG_SCRIPT."
     else
         echo "Warning: hotplug.d is not supported on this system."
