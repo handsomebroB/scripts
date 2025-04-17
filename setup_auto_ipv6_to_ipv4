@@ -15,6 +15,10 @@ if ! command -v nft >/dev/null; then
     echo "Run: opkg update && opkg install nftables"
     exit 1
 fi
+if ! command -v awk >/dev/null; then
+    echo "Error: 'awk' command not found. Please install 'busybox' or a compatible package."
+    exit 1
+fi
 echo "Dependencies check passed."
 
 # 存储规则的临时文件
@@ -30,19 +34,39 @@ while true; do
         echo "Error: No network interfaces found. Please check your network configuration."
         exit 1
     fi
-    echo "$INTERFACES" | nl -w2 -s'. '
+    echo "$INTERFACES" | awk '{printf "%2d. %s\n", NR, $0}'
     echo "-------------------------------------------------------"
     echo "Please select an interface by number (e.g., 1):"
-    read IF_NUM
-    IF_NAME=$(echo "$INTERFACES" | sed -n "${IF_NUM}p")
-    if [ -z "$IF_NAME" ]; then
-        echo "Error: Invalid selection. Please try again."
-        continue
-    fi
+    MAX_RETRIES=3
+    RETRY_COUNT=0
+    while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+        read IF_NUM
+        IF_NAME=$(echo "$INTERFACES" | sed -n "${IF_NUM}p")
+        if [ -z "$IF_NAME" ]; then
+            echo "Error: Invalid selection. Please try again."
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+                echo "Error: Too many invalid attempts. Exiting."
+                exit 1
+            fi
+            continue
+        fi
+        # 验证网卡是否存在
+        if ! ip link show "$IF_NAME" >/dev/null 2>&1; then
+            echo "Error: Interface '$IF_NAME' does not exist. Please try again."
+            RETRY_COUNT=$((RETRY_COUNT + 1))
+            if [ $RETRY_COUNT -eq $MAX_RETRIES ]; then
+                echo "Error: Too many invalid attempts. Exiting."
+                exit 1
+            fi
+            continue
+        fi
+        break
+    done
     echo "Selected interface: $IF_NAME"
 
     # 获取接口的 IPv6 地址（仅供参考）
-    IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | grep -oP '(?<=inet6\s)[0-9a-f:]+(?=/)' | head -1)
+    IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
     if [ -z "$IPV6_ADDR" ]; then
         echo "Warning: No IPv6 address found for $IF_NAME. Address will be dynamically fetched at runtime."
     else
@@ -134,7 +158,7 @@ grep "^$INTERFACE:" "$RULES_FILE" >/dev/null || exit 0
 logger -t ipv6_nat "Interface $INTERFACE is up. Checking and applying NAT forwarding rules."
 
 # 获取当前 IPv6 地址
-IPV6_ADDR=$(ip -6 addr show dev "$INTERFACE" | grep -oP '(?<=inet6\s)[0-9a-f:]+(?=/)' | head -1)
+IPV6_ADDR=$(ip -6 addr show dev "$INTERFACE" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
 if [ -z "$IPV6_ADDR" ]; then
     logger -t ipv6_nat "No IPv6 address found for $INTERFACE. Skipping."
     exit 0
@@ -208,8 +232,51 @@ EOF
                 echo "Invalid interval. Using default interval of 5 minutes."
                 CRON_INTERVAL=5
             fi
+            # 创建单独的 cron 脚本
+            CRON_SCRIPT="/etc/cron.d/ipv6_nat_forward.sh"
+            cat > "$CRON_SCRIPT" << 'EOF'
+#!/bin/sh
+RULES_FILE="/etc/nat_forward_rules"
+STATUS_FILE="/tmp/ipv6_nat_status"
+SUCCESS_COUNT=0
+TOTAL_RULES=$(wc -l < "$RULES_FILE")
+NEED_UPDATE=0
+while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
+    ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"
+    IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
+    if [ -n "$IPV6_ADDR" ] && ( [ ! -f "$ADDRESS_FILE" ] || ! grep -q "$IPV6_ADDR" "$ADDRESS_FILE" ) || ( [ ! -f "$STATUS_FILE" ] || ! grep -q "success" "$STATUS_FILE" ); then
+        NEED_UPDATE=1
+        break
+    fi
+done < "$RULES_FILE"
+if [ $NEED_UPDATE -eq 1 ]; then
+    nft flush table inet my_nat_table 2>/dev/null || true
+    nft delete table inet my_nat_table 2>/dev/null || true
+    nft add table inet my_nat_table 2>/dev/null || true
+    nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true
+    nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+    while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
+        ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"
+        IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
+        if [ -n "$IPV6_ADDR" ] && nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && \
+           nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            echo "$IPV6_ADDR" > "$ADDRESS_FILE"
+            logger -t ipv6_nat "Rule applied for $IF_NAME via cron with IPv6 $IPV6_ADDR."
+        fi
+    done < "$RULES_FILE"
+    if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then
+        echo "success" > "$STATUS_FILE"
+        logger -t ipv6_nat "All $SUCCESS_COUNT/$TOTAL_RULES rules applied via cron."
+    else
+        echo "partial" > "$STATUS_FILE"
+        logger -t ipv6_nat "Only $SUCCESS_COUNT/$TOTAL_RULES rules applied via cron."
+    fi
+fi
+EOF
+            chmod +x "$CRON_SCRIPT" 2>/dev/null || true
             # 添加定时任务
-            CRON_JOB="*/$CRON_INTERVAL * * * * /bin/sh -c 'RULES_FILE=\"/etc/nat_forward_rules\"; STATUS_FILE=\"/tmp/ipv6_nat_status\"; SUCCESS_COUNT=0; TOTAL_RULES=$(wc -l < \"$RULES_FILE\"); NEED_UPDATE=0; while IFS=\":\" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do ADDRESS_FILE=\"/tmp/ipv6_nat_address_\$IF_NAME\"; IPV6_ADDR=$(ip -6 addr show dev \"\$IF_NAME\" | grep -oP \"(?<=inet6\s)[0-9a-f:]+(?=/)\" | head -1); if [ -n \"\$IPV6_ADDR\" ] && ( [ ! -f \"\$ADDRESS_FILE\" ] || ! grep -q \"\$IPV6_ADDR\" \"\$ADDRESS_FILE\" ) || ( [ ! -f \"\$STATUS_FILE\" ] || ! grep -q \"success\" \"\$STATUS_FILE\" ); then NEED_UPDATE=1; break; fi; done < \"$RULES_FILE\"; if [ \$NEED_UPDATE -eq 1 ]; then nft flush table inet my_nat_table 2>/dev/null || true; nft delete table inet my_nat_table 2>/dev/null || true; nft add table inet my_nat_table 2>/dev/null || true; nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true; nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true; while IFS=\":\" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do ADDRESS_FILE=\"/tmp/ipv6_nat_address_\$IF_NAME\"; IPV6_ADDR=$(ip -6 addr show dev \"\$IF_NAME\" | grep -oP \"(?<=inet6\s)[0-9a-f:]+(?=/)\" | head -1); if [ -n \"\$IPV6_ADDR\" ] && nft add rule inet my_nat_table nat iifname \"\$IF_NAME\" ip6 daddr \$IPV6_ADDR \$PROTO dport \$SRC_PORT dnat to \$DEST_IP:\$DEST_PORT 2>/dev/null && nft add rule inet my_nat_table postrouting ip saddr \$DEST_IP \$PROTO sport \$DEST_PORT snat to \$IPV6_ADDR 2>/dev/null; then SUCCESS_COUNT=$((\$SUCCESS_COUNT + 1)); echo \"\$IPV6_ADDR\" > \"\$ADDRESS_FILE\"; logger -t ipv6_nat \"Rule applied for \$IF_NAME via cron with IPv6 \$IPV6_ADDR.\"; fi; done < \"$RULES_FILE\"; if [ \$SUCCESS_COUNT -eq \$TOTAL_RULES ]; then echo \"success\" > \"\$STATUS_FILE\"; logger -t ipv6_nat \"All \$SUCCESS_COUNT/\$TOTAL_RULES rules applied via cron.\"; else echo \"partial\" > \"\$STATUS_FILE\"; logger -t ipv6_nat \"Only \$SUCCESS_COUNT/\$TOTAL_RULES rules applied via cron.\"; fi; fi'"
+            CRON_JOB="*/$CRON_INTERVAL * * * * $CRON_SCRIPT"
             (crontab -l 2>/dev/null | grep -v "ipv6_nat_forward"; echo "$CRON_JOB") | crontab -
             echo "Cron job added to check and apply rules every $CRON_INTERVAL minutes if not successful or if IPv6 address changes."
             echo "Note: The cron job has minimal impact on system performance (negligible CPU and memory usage)."
@@ -235,8 +302,51 @@ else
             echo "Invalid interval. Using default interval of 5 minutes."
             CRON_INTERVAL=5
         fi
+        # 创建单独的 cron 脚本
+        CRON_SCRIPT="/etc/cron.d/ipv6_nat_forward.sh"
+        cat > "$CRON_SCRIPT" << 'EOF'
+#!/bin/sh
+RULES_FILE="/etc/nat_forward_rules"
+STATUS_FILE="/tmp/ipv6_nat_status"
+SUCCESS_COUNT=0
+TOTAL_RULES=$(wc -l < "$RULES_FILE")
+NEED_UPDATE=0
+while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
+    ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"
+    IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
+    if [ -n "$IPV6_ADDR" ] && ( [ ! -f "$ADDRESS_FILE" ] || ! grep -q "$IPV6_ADDR" "$ADDRESS_FILE" ) || ( [ ! -f "$STATUS_FILE" ] || ! grep -q "success" "$STATUS_FILE" ); then
+        NEED_UPDATE=1
+        break
+    fi
+done < "$RULES_FILE"
+if [ $NEED_UPDATE -eq 1 ]; then
+    nft flush table inet my_nat_table 2>/dev/null || true
+    nft delete table inet my_nat_table 2>/dev/null || true
+    nft add table inet my_nat_table 2>/dev/null || true
+    nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true
+    nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+    while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
+        ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"
+        IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
+        if [ -n "$IPV6_ADDR" ] && nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && \
+           nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            echo "$IPV6_ADDR" > "$ADDRESS_FILE"
+            logger -t ipv6_nat "Rule applied for $IF_NAME via cron with IPv6 $IPV6_ADDR."
+        fi
+    done < "$RULES_FILE"
+    if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then
+        echo "success" > "$STATUS_FILE"
+        logger -t ipv6_nat "All $SUCCESS_COUNT/$TOTAL_RULES rules applied via cron."
+    else
+        echo "partial" > "$STATUS_FILE"
+        logger -t ipv6_nat "Only $SUCCESS_COUNT/$TOTAL_RULES rules applied via cron."
+    fi
+fi
+EOF
+        chmod +x "$CRON_SCRIPT" 2>/dev/null || true
         # 添加定时任务
-        CRON_JOB="*/$CRON_INTERVAL * * * * /bin/sh -c 'RULES_FILE=\"/etc/nat_forward_rules\"; STATUS_FILE=\"/tmp/ipv6_nat_status\"; SUCCESS_COUNT=0; TOTAL_RULES=$(wc -l < \"$RULES_FILE\"); NEED_UPDATE=0; while IFS=\":\" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do ADDRESS_FILE=\"/tmp/ipv6_nat_address_\$IF_NAME\"; IPV6_ADDR=$(ip -6 addr show dev \"\$IF_NAME\" | grep -oP \"(?<=inet6\s)[0-9a-f:]+(?=/)\" | head -1); if [ -n \"\$IPV6_ADDR\" ] && ( [ ! -f \"\$ADDRESS_FILE\" ] || ! grep -q \"\$IPV6_ADDR\" \"\$ADDRESS_FILE\" ) || ( [ ! -f \"\$STATUS_FILE\" ] || ! grep -q \"success\" \"\$STATUS_FILE\" ); then NEED_UPDATE=1; break; fi; done < \"$RULES_FILE\"; if [ \$NEED_UPDATE -eq 1 ]; then nft flush table inet my_nat_table 2>/dev/null || true; nft delete table inet my_nat_table 2>/dev/null || true; nft add table inet my_nat_table 2>/dev/null || true; nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true; nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true; while IFS=\":\" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do ADDRESS_FILE=\"/tmp/ipv6_nat_address_\$IF_NAME\"; IPV6_ADDR=$(ip -6 addr show dev \"\$IF_NAME\" | grep -oP \"(?<=inet6\s)[0-9a-f:]+(?=/)\" | head -1); if [ -n \"\$IPV6_ADDR\" ] && nft add rule inet my_nat_table nat iifname \"\$IF_NAME\" ip6 daddr \$IPV6_ADDR \$PROTO dport \$SRC_PORT dnat to \$DEST_IP:\$DEST_PORT 2>/dev/null && nft add rule inet my_nat_table postrouting ip saddr \$DEST_IP \$PROTO sport \$DEST_PORT snat to \$IPV6_ADDR 2>/dev/null; then SUCCESS_COUNT=$((\$SUCCESS_COUNT + 1)); echo \"\$IPV6_ADDR\" > \"\$ADDRESS_FILE\"; logger -t ipv6_nat \"Rule applied for \$IF_NAME via cron with IPv6 \$IPV6_ADDR.\"; fi; done < \"$RULES_FILE\"; if [ \$SUCCESS_COUNT -eq \$TOTAL_RULES ]; then echo \"success\" > \"\$STATUS_FILE\"; logger -t ipv6_nat \"All \$SUCCESS_COUNT/\$TOTAL_RULES rules applied via cron.\"; else echo \"partial\" > \"\$STATUS_FILE\"; logger -t ipv6_nat \"Only \$SUCCESS_COUNT/\$TOTAL_RULES rules applied via cron.\"; fi; fi'"
+        CRON_JOB="*/$CRON_INTERVAL * * * * $CRON_SCRIPT"
         (crontab -l 2>/dev/null | grep -v "ipv6_nat_forward"; echo "$CRON_JOB") | crontab -
         echo "Cron job added to check and apply rules every $CRON_INTERVAL minutes if not successful or if IPv6 address changes."
         echo "Note: The cron job has minimal impact on system performance (negligible CPU and memory usage)."
@@ -252,7 +362,7 @@ read APPLY_NOW
 if [ "$APPLY_NOW" = "y" ] || [ "$APPLY_NOW" = "Y" ]; then
     # 直接应用规则
     echo "Applying rules directly..."
-    /bin/sh -c 'RULES_FILE="/etc/nat_forward_rules"; STATUS_FILE="/tmp/ipv6_nat_status"; nft flush table inet my_nat_table 2>/dev/null || true; nft delete table inet my_nat_table 2>/dev/null || true; nft add table inet my_nat_table 2>/dev/null || true; nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true; nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true; SUCCESS_COUNT=0; TOTAL_RULES=$(wc -l < "$RULES_FILE"); while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | grep -oP "(?<=inet6\s)[0-9a-f:]+(?=/)" | head -1); ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"; if [ -n "$IPV6_ADDR" ] && nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then SUCCESS_COUNT=$(($SUCCESS_COUNT + 1)); echo "$IPV6_ADDR" > "$ADDRESS_FILE"; logger -t ipv6_nat "Rule applied for $IF_NAME manually with IPv6 $IPV6_ADDR."; fi; done < "$RULES_FILE"; if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then echo "success" > "$STATUS_FILE"; logger -t ipv6_nat "All $SUCCESS_COUNT/$TOTAL_RULES rules applied manually."; else echo "partial" > "$STATUS_FILE"; logger -t ipv6_nat "Only $SUCCESS_COUNT/$TOTAL_RULES rules applied manually."; fi'
+    /bin/sh -c 'RULES_FILE="/etc/nat_forward_rules"; STATUS_FILE="/tmp/ipv6_nat_status"; nft flush table inet my_nat_table 2>/dev/null || true; nft delete table inet my_nat_table 2>/dev/null || true; nft add table inet my_nat_table 2>/dev/null || true; nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true; nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true; SUCCESS_COUNT=0; TOTAL_RULES=$(wc -l < "$RULES_FILE"); while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk "/inet6/ {split(\$2, a, \"/\"); print a[1]}" | head -1); ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"; if [ -n "$IPV6_ADDR" ] && nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then SUCCESS_COUNT=$(($SUCCESS_COUNT + 1)); echo "$IPV6_ADDR" > "$ADDRESS_FILE"; logger -t ipv6_nat "Rule applied for $IF_NAME manually with IPv6 $IPV6_ADDR."; fi; done < "$RULES_FILE"; if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then echo "success" > "$STATUS_FILE"; logger -t ipv6_nat "All $SUCCESS_COUNT/$TOTAL_RULES rules applied manually."; else echo "partial" > "$STATUS_FILE"; logger -t ipv6_nat "Only $SUCCESS_COUNT/$TOTAL_RULES rules applied manually."; fi'
     echo "Rules applied. Check logs with 'logread | grep ipv6_nat' for details."
 fi
 
