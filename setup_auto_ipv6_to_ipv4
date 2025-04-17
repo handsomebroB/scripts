@@ -29,12 +29,15 @@ RULES_FILE="/tmp/nat_forward_rules"
 while true; do
     echo "-------------------------------------------------------"
     echo "列出可用的网络接口："
+    # 获取网络接口列表，确保按行分割
     INTERFACES=$(ip link show | grep '^[0-9]' | cut -d: -f2 | awk '{print $1}' | grep -v 'lo')
     if [ -z "$INTERFACES" ]; then
         echo "错误：未找到网络接口。请检查您的网络配置。"
         exit 1
     fi
-    echo "$INTERFACES" | awk '{printf "%2d. %s\n", NR, $0}'
+    # 使用临时文件存储接口列表，确保换行符不丢失
+    echo "$INTERFACES" > /tmp/interfaces_list
+    awk '{printf "%2d. %s\n", NR, $0}' /tmp/interfaces_list
     echo "-------------------------------------------------------"
     echo "请选择一个接口编号（例如，1）："
     MAX_RETRIES=3
@@ -51,7 +54,8 @@ while true; do
             fi
             continue
         fi
-        IF_NAME=$(echo "$INTERFACES" | awk 'NR=='"$IF_NUM"' {print $0}')
+        # 使用 awk 从临时文件中提取指定行，确保换行符不影响结果
+        IF_NAME=$(awk 'NR=='"$IF_NUM"' {print $0}' /tmp/interfaces_list)
         if [ -z "$IF_NAME" ]; then
             echo "错误：无效的选择。请重试。"
             RETRY_COUNT=$((RETRY_COUNT + 1))
