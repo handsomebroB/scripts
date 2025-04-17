@@ -21,6 +21,17 @@ if ! command -v awk >/dev/null; then
 fi
 echo "依赖项检查通过。"
 
+# 检查是否以 root 权限运行
+if [ "$(id -u)" != "0" ]; then
+    echo "警告：此脚本需要 root 权限来应用 nftables 规则。请以 root 用户或使用 sudo 运行脚本。"
+    echo "是否继续？（y/n）"
+    read CONTINUE_ROOT
+    if [ "$CONTINUE_ROOT" != "y" ] && [ "$CONTINUE_ROOT" != "Y" ]; then
+        echo "脚本已退出。请以 root 权限重新运行。"
+        exit 1
+    fi
+fi
+
 # 存储规则的临时文件
 RULES_FILE="/tmp/nat_forward_rules"
 > "$RULES_FILE"
@@ -214,17 +225,23 @@ while IFS=':' read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
     # 仅处理与当前接口相关的规则
     if [ "$IF_NAME" = "$INTERFACE" ]; then
         logger -t ipv6_nat "为 $IF_NAME 应用规则，IPv6 地址 $IPV6_ADDR: $SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)"
-        if nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && \
-           nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then
-            logger -t ipv6_nat "规则已为 $IF_NAME 应用。"
+        DNAT_ERROR=$(nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>&1)
+        if [ $? -eq 0 ]; then
+            logger -t ipv6_nat "DNAT 规则已为 $IF_NAME 应用。"
+        else
+            logger -t ipv6_nat "无法为 $IF_NAME 应用 DNAT 规则。错误信息: $DNAT_ERROR"
+        fi
+        SNAT_ERROR=$(nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>&1)
+        if [ $? -eq 0 ]; then
+            logger -t ipv6_nat "SNAT 规则已为 $IF_NAME 应用。"
             SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
         else
-            logger -t ipv6_nat "无法为 $IF_NAME 应用规则。"
+            logger -t ipv6_nat "无法为 $IF_NAME 应用 SNAT 规则。错误信息: $SNAT_ERROR"
         fi
     fi
 done < "$RULES_FILE"
 
-# 更新状态文件和地址文件
+# 更新状态文件和地址 Ascend
 if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then
     echo "success" > "$STATUS_FILE"
     echo "$IPV6_ADDR" > "$ADDRESS_FILE"
@@ -249,33 +266,40 @@ fi
 echo "是否要添加 cron 任务以定期检查并应用规则？（y/n）"
 echo "注意：这将定期检查接口状态和规则应用情况，作为备用机制。"
 read USE_CRON
-CRON_SCRIPT="/etc/cron.d/ipv6_nat_forward.sh"
 if [ "$USE_CRON" = "y" ] || [ "$USE_CRON" = "Y" ]; then
-    # 安装 cron（如果未安装）
-    if ! opkg list-installed | grep -q cron; then
-        echo "安装 cron 用于定时任务..."
-        opkg update
-        opkg install cron
-    fi
-    # 提示用户选择 cron 任务的时间间隔
-    echo "请输入 cron 任务的时间间隔（分钟，例如，5 表示每 5 分钟，推荐）："
-    read CRON_INTERVAL
-    if ! echo "$CRON_INTERVAL" | grep -q '^[0-9]\+$' || [ "$CRON_INTERVAL" -lt 1 ] || [ "$CRON_INTERVAL" -gt 60 ]; then
-        echo "无效的间隔。使用默认间隔 5 分钟。"
-        CRON_INTERVAL=5
-    fi
-    # 检查是否已存在 cron 脚本
-    if [ -f "$CRON_SCRIPT" ]; then
-        echo "警告：cron 脚本 $CRON_SCRIPT 已存在。是否覆盖？（y/n）"
-        read OVERWRITE_CRON
-        if [ "$OVERWRITE_CRON" != "y" ] && [ "$OVERWRITE_CRON" != "Y" ]; then
-            echo "不覆盖现有 cron 脚本，跳过配置。"
-            USE_CRON="n"
+    # 检查 cron 功能是否可用
+    if ! command -v crontab >/dev/null; then
+        echo "错误：未找到 'crontab' 命令。cron 功能不可用，无法配置定时任务。"
+        echo "请手动安装 cron 相关包（如 cronie 或 busybox），然后重新运行脚本。"
+        USE_CRON="n"
+    else
+        echo "cron 功能已检测到，将使用现有功能配置定时任务。"
+        # 提示用户选择 cron 任务的时间间隔
+        echo "请输入 cron 任务的时间间隔（分钟，例如，5 表示每 5 分钟，推荐）："
+        read CRON_INTERVAL
+        if ! echo "$CRON_INTERVAL" | grep -q '^[0-9]\+$' || [ "$CRON_INTERVAL" -lt 1 ] || [ "$CRON_INTERVAL" -gt 60 ]; then
+            echo "无效的间隔。使用默认间隔 5 分钟。"
+            CRON_INTERVAL=5
         fi
-    fi
-    if [ "$USE_CRON" = "y" ] || [ "$USE_CRON" = "Y" ]; then
-        # 创建单独的 cron 脚本
-        cat > "$CRON_SCRIPT" << 'EOF'
+        # 确定 cron 脚本路径，优先使用 /etc/cron.d/，如果不可用则使用 /etc/
+        CRON_SCRIPT="/etc/cron.d/ipv6_nat_forward.sh"
+        CRON_DIR="/etc/cron.d"
+        if ! mkdir -p "$CRON_DIR" 2>/dev/null; then
+            echo "警告：无法创建 $CRON_DIR 目录，将使用备用路径 /etc/。"
+            CRON_SCRIPT="/etc/ipv6_nat_forward.sh"
+        fi
+        # 检查是否已存在 cron 脚本
+        if [ -f "$CRON_SCRIPT" ]; then
+            echo "警告：cron 脚本 $CRON_SCRIPT 已存在。是否覆盖？（y/n）"
+            read OVERWRITE_CRON
+            if [ "$OVERWRITE_CRON" != "y" ] && [ "$OVERWRITE_CRON" != "Y" ]; then
+                echo "不覆盖现有 cron 脚本，跳过配置。"
+                USE_CRON="n"
+            fi
+        fi
+        if [ "$USE_CRON" = "y" ] || [ "$USE_CRON" = "Y" ]; then
+            # 创建 cron 脚本
+            cat > "$CRON_SCRIPT" << 'EOF'
 #!/bin/sh
 RULES_FILE="/etc/nat_forward_rules"
 STATUS_FILE="/tmp/ipv6_nat_status"
@@ -299,13 +323,23 @@ if [ $NEED_UPDATE -eq 1 ]; then
     while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
         ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"
         IPV6_ADDR=$(ip -6 addr show dev "$IF_NAME" | awk '/inet6/ {split($2, a, "/"); print a[1]}' | head -1)
-        if [ -n "$IPV6_ADDR" ] && nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && \
-           nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then
-            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            echo "$IPV6_ADDR" > "$ADDRESS_FILE"
-            logger -t ipv6_nat "规则已通过 cron 为 $IF_NAME 应用，IPv6 地址为 $IPV6_ADDR。"
+        if [ -n "$IPV6_ADDR" ]; then
+            logger -t ipv6_nat "尝试通过 cron 为 $IF_NAME 应用规则，IPv6 地址为 $IPV6_ADDR: $SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)"
+            DNAT_ERROR=$(nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>&1)
+            if [ $? -eq 0 ]; then
+                logger -t ipv6_nat "DNAT 规则已通过 cron 为 $IF_NAME 应用。"
+            else
+                logger -t ipv6_nat "无法通过 cron 为 $IF_NAME 应用 DNAT 规则。错误信息: $DNAT_ERROR"
+            fi
+            SNAT_ERROR=$(nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>&1)
+            if [ $? -eq 0 ]; then
+                logger -t ipv6_nat "SNAT 规则已通过 cron 为 $IF_NAME 应用。"
+                SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+            else
+                logger -t ipv6_nat "无法通过 cron 为 $IF_NAME 应用 SNAT 规则。错误信息: $SNAT_ERROR"
+            fi
         else
-            logger -t ipv6_nat "无法通过 cron 为 $IF_NAME 应用规则，IPv6 地址为 $IPV6_ADDR。"
+            logger -t ipv6_nat "未找到 $IF_NAME 的 IPv6 地址，跳过规则应用。"
         fi
     done < "$RULES_FILE"
     if [ $SUCCESS_COUNT -eq $TOTAL_RULES ]; then
@@ -317,12 +351,13 @@ if [ $NEED_UPDATE -eq 1 ]; then
     fi
 fi
 EOF
-        chmod +x "$CRON_SCRIPT" 2>/dev/null || true
-        # 添加定时任务
-        CRON_JOB="*/$CRON_INTERVAL * * * * $CRON_SCRIPT"
-        (crontab -l 2>/dev/null | grep -v "ipv6_nat_forward"; echo "$CRON_JOB") | crontab -
-        echo "Cron 任务已添加，每 $CRON_INTERVAL 分钟检查并应用规则（如果未成功或 IPv6 地址变更）。"
-        echo "注意：cron 任务对系统性能影响极小（CPU 和内存使用量可忽略）。"
+            chmod +x "$CRON_SCRIPT" 2>/dev/null || true
+            # 添加定时任务
+            CRON_JOB="*/$CRON_INTERVAL * * * * $CRON_SCRIPT"
+            (crontab -l 2>/dev/null | grep -v "ipv6_nat_forward"; echo "$CRON_JOB") | crontab -
+            echo "Cron 任务已添加，每 $CRON_INTERVAL 分钟检查并应用规则（如果未成功或 IPv6 地址变更）。"
+            echo "注意：cron 任务对系统性能影响极小（CPU 和内存使用量可忽略）。"
+        fi
     fi
 else
     if [ "$USE_HOTPLUG" != "y" ] && [ "$USE_HOTPLUG" != "Y" ]; then
@@ -343,9 +378,25 @@ RULES_FILE="/etc/nat_forward_rules"
 STATUS_FILE="/tmp/ipv6_nat_status"
 nft flush table inet my_nat_table 2>/dev/null || true
 nft delete table inet my_nat_table 2>/dev/null || true
-nft add table inet my_nat_table 2>/dev/null || true
-nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>/dev/null || true
-nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>/dev/null || true
+logger -t ipv6_nat "已清理旧的 NAT 表和规则。"
+TABLE_ERROR=$(nft add table inet my_nat_table 2>&1)
+if [ $? -eq 0 ]; then
+    logger -t ipv6_nat "成功创建 NAT 表 my_nat_table。"
+else
+    logger -t ipv6_nat "创建 NAT 表 my_nat_table 失败。错误信息: $TABLE_ERROR"
+fi
+PRE_ERROR=$(nft add chain inet my_nat_table nat { type nat hook prerouting priority 0 \; } 2>&1)
+if [ $? -eq 0 ]; then
+    logger -t ipv6_nat "成功创建 prerouting 链。"
+else
+    logger -t ipv6_nat "创建 prerouting 链失败。错误信息: $PRE_ERROR"
+fi
+POST_ERROR=$(nft add chain inet my_nat_table postrouting { type nat hook postrouting priority 100 \; } 2>&1)
+if [ $? -eq 0 ]; then
+    logger -t ipv6_nat "成功创建 postrouting 链。"
+else
+    logger -t ipv6_nat "创建 postrouting 链失败。错误信息: $POST_ERROR"
+fi
 SUCCESS_COUNT=0
 TOTAL_RULES=$(wc -l < "$RULES_FILE")
 while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
@@ -353,14 +404,20 @@ while IFS=":" read -r IF_NAME SRC_PORT DEST_IP DEST_PORT PROTO; do
     ADDRESS_FILE="/tmp/ipv6_nat_address_$IF_NAME"
     if [ -n "$IPV6_ADDR" ]; then
         logger -t ipv6_nat "尝试为 $IF_NAME 应用规则，IPv6 地址为 $IPV6_ADDR: $SRC_PORT -> $DEST_IP:$DEST_PORT ($PROTO)"
-        if nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>/dev/null && \
-           nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>/dev/null; then
-            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
-            echo "$IPV6_ADDR" > "$ADDRESS_FILE"
-            logger -t ipv6_nat "规则已手动为 $IF_NAME 应用，IPv6 地址为 $IPV6_ADDR。"
+        DNAT_ERROR=$(nft add rule inet my_nat_table nat iifname "$IF_NAME" ip6 daddr $IPV6_ADDR $PROTO dport $SRC_PORT dnat to $DEST_IP:$DEST_PORT 2>&1)
+        if [ $? -eq 0 ]; then
+            logger -t ipv6_nat "DNAT 规则已手动为 $IF_NAME 应用。"
         else
-            logger -t ipv6_nat "无法为 $IF_NAME 应用规则，IPv6 地址为 $IPV6_ADDR。"
+            logger -t ipv6_nat "无法为 $IF_NAME 应用 DNAT 规则。错误信息: $DNAT_ERROR"
         fi
+        SNAT_ERROR=$(nft add rule inet my_nat_table postrouting ip saddr $DEST_IP $PROTO sport $DEST_PORT snat to $IPV6_ADDR 2>&1)
+        if [ $? -eq 0 ]; then
+            logger -t ipv6_nat "SNAT 规则已手动为 $IF_NAME 应用。"
+            SUCCESS_COUNT=$((SUCCESS_COUNT + 1))
+        else
+            logger -t ipv6_nat "无法为 $IF_NAME 应用 SNAT 规则。错误信息: $SNAT_ERROR"
+        fi
+        echo "$IPV6_ADDR" > "$ADDRESS_FILE"
     else
         logger -t ipv6_nat "未找到 $IF_NAME 的 IPv6 地址，跳过规则应用。"
     fi
@@ -372,11 +429,18 @@ else
     echo "partial" > "$STATUS_FILE"
     logger -t ipv6_nat "仅 $SUCCESS_COUNT/$TOTAL_RULES 条规则已手动应用。"
 fi
+# 检查规则是否成功应用
+if nft list table inet my_nat_table 2>/dev/null; then
+    logger -t ipv6_nat "NAT 表 my_nat_table 已成功创建，规则应用完成。"
+else
+    logger -t ipv6_nat "无法找到 NAT 表 my_nat_table，规则应用可能失败。"
+fi
 EOF
     chmod +x "$APPLY_SCRIPT" 2>/dev/null || true
     /bin/sh "$APPLY_SCRIPT"
-    echo "规则已应用。使用 'logread | grep ipv6_nat' 查看日志详情。"
+    echo "规则已应用。使用 'logread | grep ipv6_nat' 查看详细日志。"
     echo "您也可以使用 'nft list ruleset' 检查 NAT 规则是否正确加载。"
+    echo "如果转发仍未生效，请检查系统防火墙设置或与其他规则的冲突。"
 fi
 
 echo "设置完成。规则将通过 hotplug 或 cron 应用（如果已配置）。"
